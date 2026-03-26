@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>网络拓扑图（GraphQL）</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif; background: #0f172a; color: #e2e8f0; }
+    #app { display: flex; height: 100%; }
+    #toolbar { width: 280px; border-right: 1px solid #1f2937; padding: 12px; box-sizing: border-box; background: #111827; }
+    #canvas-wrap { flex: 1; position: relative; }
+    #topo { width: 100%; height: 100%; }
+    .node circle { fill: #38bdf8; stroke: #0ea5e9; stroke-width: 2; }
+    .node text { fill: #e2e8f0; font-size: 12px; pointer-events: none; }
+    .link path { stroke: #94a3b8; stroke-width: 2; fill: none; }
+    .link text { fill: #f8fafc; font-size: 11px; pointer-events: none; }
+    .label-bg { fill: #1f2937; stroke: #334155; stroke-width: 1; rx: 4; ry: 4; }
+    .node { cursor: grab; }
+    .node.dragging { cursor: grabbing; }
+    button { width: 100%; margin: 6px 0; padding: 8px 10px; border: 1px solid #374151; background: #1f2937; color: #e5e7eb; border-radius: 6px; }
+    button:hover { background: #111827; }
+    input { width: 100%; margin: 6px 0; padding: 8px 10px; border: 1px solid #374151; background: #111827; color: #e5e7eb; border-radius: 6px; box-sizing: border-box; }
+    .hint { font-size: 12px; color: #9ca3af; margin-top: 8px; line-height: 1.4; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="toolbar">
+      <h3 style="margin:0 0 8px 0">网络拓扑（GraphQL）</h3>
+      <div class="hint" id="hint">数据源：/api/graphql/</div>
+      <input id="nb-url" value="http://172.16.114.128:8080" />
+      <input id="nb-token" type="password" placeholder="Nautobot Token" />
+      <button id="load">从 GraphQL 加载</button>
+      <button id="layout-h">横向布局</button>
+      <button id="layout-v">纵向布局</button>
+      <button id="export">导出JSON</button>
+    </div>
+    <div id="canvas-wrap">
+      <svg id="topo"></svg>
+    </div>
+  </div>
+  <script>
+    const state = { devices: [], links: [] };
+    const topo = document.getElementById("topo");
+    const wrap = document.getElementById("canvas-wrap");
+    const hint = document.getElementById("hint");
+
+    function normalizeBase(u) {
+      return u.replace(/\/+$/, "");
+    }
+
+    function getToken() {
+      return document.getElementById("nb-token").value.trim();
+    }
+
+    function getBaseUrl() {
+      return normalizeBase(document.getElementById("nb-url").value.trim());
+    }
+
+    function size() {
+      const r = wrap.getBoundingClientRect();
+      topo.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
+      topo.setAttribute("width", r.width);
+      topo.setAttribute("height", r.height);
+    }
+    size();
+    window.addEventListener("resize", size);
+
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.setAttribute("id", "arrow");
+    marker.setAttribute("viewBox", "0 0 10 10");
+    marker.setAttribute("refX", "10");
+    marker.setAttribute("refY", "5");
+    marker.setAttribute("markerWidth", "8");
+    marker.setAttribute("markerHeight", "8");
+    marker.setAttribute("orient", "auto-start-reverse");
+    const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    arrow.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+    arrow.setAttribute("fill", "#94a3b8");
+    marker.appendChild(arrow);
+    defs.appendChild(marker);
+    topo.appendChild(defs);
+
+    const linkLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    const nodeLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
+    topo.appendChild(linkLayer);
+    topo.appendChild(nodeLayer);
+
+    function linePath(x1, y1, x2, y2) {
+      return `M ${x1} ${y1} L ${x2} ${y2}`;
+    }
+
+    function findDevice(id) {
+      return state.devices.find(d => d.id === id);
+    }
+
+    const nodeEls = new Map();
+    const linkEls = new Map();
+
+    function createNode(d) {
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.classList.add("node");
+      g.setAttribute("data-id", d.id);
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("cx", d.x);
+      c.setAttribute("cy", d.y);
+      c.setAttribute("r", d.r);
+      const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      t.setAttribute("x", d.x);
+      t.setAttribute("y", d.y - d.r - 8);
+      t.setAttribute("text-anchor", "middle");
+      t.textContent = d.name;
+      g.appendChild(c);
+      g.appendChild(t);
+      nodeLayer.appendChild(g);
+      return g;
+    }
+
+    function createLink(l) {
+      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+      g.classList.add("link");
+      g.setAttribute("data-id", l.id);
+      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      p.setAttribute("marker-end", "url(#arrow)");
+      const srcBg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      srcBg.classList.add("label-bg");
+      const srcText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      srcText.setAttribute("text-anchor", "middle");
+      srcText.setAttribute("data-role", "src-text");
+      srcText.textContent = l.sourceLabel || "";
+      const tgtBg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      tgtBg.classList.add("label-bg");
+      const tgtText = document.createElementNS("http://www.w3.org/2000/svg", "text");
+      tgtText.setAttribute("text-anchor", "middle");
+      tgtText.setAttribute("data-role", "tgt-text");
+      tgtText.textContent = l.targetLabel || "";
+      g.appendChild(p);
+      g.appendChild(srcBg);
+      g.appendChild(srcText);
+      g.appendChild(tgtBg);
+      g.appendChild(tgtText);
+      linkLayer.appendChild(g);
+      return g;
+    }
+
+    function updateNode(d) {
+      const g = nodeEls.get(d.id);
+      if (!g) return;
+      const c = g.querySelector("circle");
+      const t = g.querySelector("text");
+      c.setAttribute("cx", d.x);
+      c.setAttribute("cy", d.y);
+      t.setAttribute("x", d.x);
+      t.setAttribute("y", d.y - d.r - 8);
+    }
+
+    function updateLinkGeometry(l) {
+      const s = findDevice(l.source);
+      const t = findDevice(l.target);
+      if (!s || !t) return;
+      const el = linkEls.get(l.id);
+      if (!el) return;
+      const path = el.querySelector("path");
+      const srcRect = el.querySelector("rect:nth-of-type(1)");
+      const srcText = el.querySelector('text[data-role="src-text"]');
+      const tgtRect = el.querySelector("rect:nth-of-type(2)");
+      const tgtText = el.querySelector('text[data-role="tgt-text"]');
+      path.setAttribute("d", linePath(s.x, s.y, t.x, t.y));
+
+      const dx = t.x - s.x;
+      const dy = t.y - s.y;
+      const len = Math.hypot(dx, dy) || 1;
+      const ux = dx / len;
+      const uy = dy / len;
+      const nx = -uy;
+      const ny = ux;
+      const alongSrc = Math.min(len * 0.22, s.r + 28);
+      const alongTgt = Math.min(len * 0.22, t.r + 28);
+      const away = 18;
+
+      const sx = s.x + ux * alongSrc + nx * away;
+      const sy = s.y + uy * alongSrc + ny * away;
+      srcText.setAttribute("x", sx);
+      srcText.setAttribute("y", sy - 6);
+      let bboxS = srcText.getBBox();
+      srcRect.setAttribute("x", bboxS.x - 4);
+      srcRect.setAttribute("y", bboxS.y - 2);
+      srcRect.setAttribute("width", bboxS.width + 8);
+      srcRect.setAttribute("height", bboxS.height + 4);
+
+      const tx = t.x - ux * alongTgt + nx * away;
+      const ty = t.y - uy * alongTgt + ny * away;
+      tgtText.setAttribute("x", tx);
+      tgtText.setAttribute("y", ty - 6);
+      let bboxT = tgtText.getBBox();
+      tgtRect.setAttribute("x", bboxT.x - 4);
+      tgtRect.setAttribute("y", bboxT.y - 2);
+      tgtRect.setAttribute("width", bboxT.width + 8);
+      tgtRect.setAttribute("height", bboxT.height + 4);
+    }
+
+    function updateAllLinks() {
+      state.links.forEach(updateLinkGeometry);
+    }
+
+    function rebuildGraph(devices, links) {
+      nodeLayer.innerHTML = "";
+      linkLayer.innerHTML = "";
+      nodeEls.clear();
+      linkEls.clear();
+      state.devices = devices;
+      state.links = links;
+      state.devices.forEach(d => nodeEls.set(d.id, createNode(d)));
+      state.links.forEach(l => linkEls.set(l.id, createLink(l)));
+      updateAllLinks();
+    }
+
+    function computeLevelsUndirected() {
+      const ids = state.devices.map(d => d.id);
+      const adj = new Map(ids.map(id => [id, []]));
+      state.links.forEach(l => {
+        if (adj.has(l.source)) adj.get(l.source).push(l.target);
+        if (adj.has(l.target)) adj.get(l.target).push(l.source);
+      });
+      const level = new Map();
+      let curLevel = 0;
+      for (const start of ids) {
+        if (level.has(start)) continue;
+        level.set(start, 0);
+        const q = [start];
+        for (let qi = 0; qi < q.length; qi++) {
+          const u = q[qi];
+          const lu = level.get(u);
+          (adj.get(u) || []).forEach(v => {
+            if (!level.has(v)) {
+              level.set(v, lu + 1);
+              q.push(v);
+            }
+          });
+        }
+        curLevel++;
+      }
+      const layers = [];
+      ids.forEach(id => {
+        const l = level.get(id) || 0;
+        if (!layers[l]) layers[l] = [];
+        layers[l].push(id);
+      });
+      return layers.filter(Boolean);
+    }
+
+    function applyLayout(orientation) {
+      const layers = computeLevelsUndirected();
+      const rect = wrap.getBoundingClientRect();
+      const W = rect.width, H = rect.height;
+      const margin = 80;
+      const L = layers.length;
+      if (orientation === "horizontal") {
+        const xStep = L > 1 ? (W - margin * 2) / (L - 1) : 0;
+        layers.forEach((layer, i) => {
+          const x = L > 1 ? margin + i * xStep : W / 2;
+          const n = layer.length;
+          const yStep = n > 0 ? (H - margin * 2) / (n + 1) : 0;
+          layer.forEach((id, j) => {
+            const d = findDevice(id);
+            d.x = x;
+            d.y = margin + (j + 1) * yStep;
+            updateNode(d);
+          });
+        });
+      } else {
+        const yStep = L > 1 ? (H - margin * 2) / (L - 1) : 0;
+        layers.forEach((layer, i) => {
+          const y = L > 1 ? margin + i * yStep : H / 2;
+          const n = layer.length;
+          const xStep = n > 0 ? (W - margin * 2) / (n + 1) : 0;
+          layer.forEach((id, j) => {
+            const d = findDevice(id);
+            d.y = y;
+            d.x = margin + (j + 1) * xStep;
+            updateNode(d);
+          });
+        });
+      }
+      updateAllLinks();
+    }
+
+    let dragId = null;
+    let dragOffset = { x: 0, y: 0 };
+
+    function getPointer(evt) {
+      const pt = topo.createSVGPoint();
+      pt.x = evt.clientX;
+      pt.y = evt.clientY;
+      const m = topo.getScreenCTM().inverse();
+      const p = pt.matrixTransform(m);
+      return { x: p.x, y: p.y };
+    }
+
+    nodeLayer.addEventListener("pointerdown", e => {
+      const g = e.target.closest(".node");
+      if (!g) return;
+      const id = g.getAttribute("data-id");
+      const d = findDevice(id);
+      const p = getPointer(e);
+      dragId = id;
+      dragOffset.x = p.x - d.x;
+      dragOffset.y = p.y - d.y;
+      g.classList.add("dragging");
+      topo.setPointerCapture(e.pointerId);
+    });
+
+    topo.addEventListener("pointermove", e => {
+      if (!dragId) return;
+      const d = findDevice(dragId);
+      const p = getPointer(e);
+      const r = wrap.getBoundingClientRect();
+      const minX = d.r + 4;
+      const minY = d.r + 4;
+      const maxX = r.width - d.r - 4;
+      const maxY = r.height - d.r - 4;
+      d.x = Math.max(minX, Math.min(maxX, p.x - dragOffset.x));
+      d.y = Math.max(minY, Math.min(maxY, p.y - dragOffset.y));
+      updateNode(d);
+      updateAllLinks();
+    });
+
+    topo.addEventListener("pointerup", e => {
+      if (!dragId) return;
+      const g = nodeEls.get(dragId);
+      if (g) g.classList.remove("dragging");
+      dragId = null;
+      topo.releasePointerCapture(e.pointerId);
+    });
+
+    function ipLabel(ips) {
+      if (!ips || !ips.length) return "";
+      const list = ips.map(x => x && x.address).filter(Boolean);
+      return Array.from(new Set(list)).slice(0, 2).join(",");
+    }
+
+    function makeIfLabel(name, ips) {
+      const ip = ipLabel(ips);
+      return name ? (name + (ip ? (" " + ip) : "")) : (ip || "");
+    }
+
+    async function graphqlRequest(baseUrl, token, query) {
+      const headers = { "Content-Type": "application/json", Accept: "application/json" };
+      if (token) headers["Authorization"] = "Token " + token;
+      const target = baseUrl + "/api/graphql/";
+      const proxied = window.location.origin + "/proxy?url=" + encodeURIComponent(target);
+      const res = await fetch(proxied, { method: "POST", headers, body: JSON.stringify({ query }) });
+      const text = await res.text();
+      if (!res.ok) {
+        const msg = (text || "").slice(0, 200).replace(/\s+/g, " ").trim();
+        throw new Error("HTTP " + res.status + (msg ? (": " + msg) : ""));
+      }
+      const json = JSON.parse(text);
+      if (json.errors && json.errors.length) throw new Error(json.errors[0].message || "GraphQL error");
+      return json.data;
+    }
+
+    function buildFromGraphql(data) {
+      const rect = wrap.getBoundingClientRect();
+      const W = rect.width || 800;
+      const H = rect.height || 600;
+      const margin = 90;
+      const devMap = new Map();
+      const links = [];
+      const seen = new Set();
+
+      function ensureDevice(name) {
+        if (!name) return;
+        if (devMap.has(name)) return;
+        const idx = devMap.size;
+        devMap.set(name, {
+          id: name,
+          name,
+          x: margin + (idx % 10) * 70,
+          y: margin + Math.floor(idx / 10) * 55,
+          r: 18
+        });
+      }
+
+      const devices = (data && data.devices) ? data.devices : [];
+      devices.forEach(d => ensureDevice(d && d.name));
+
+      devices.forEach(d => {
+        const srcDev = d && d.name;
+        const ifs = d && d.interfaces ? d.interfaces : [];
+        ifs.forEach(intf => {
+          const ci = intf && intf.connected_interface ? intf.connected_interface : null;
+          if (!ci) return;
+          const dstDev = ci.device && ci.device.name ? ci.device.name : "";
+          if (!srcDev || !dstDev) return;
+          ensureDevice(srcDev);
+          ensureDevice(dstDev);
+          const aId = String(intf.id || "");
+          const bId = String(ci.id || "");
+          const key = [aId, bId].filter(Boolean).sort().join("|") || [srcDev, dstDev, intf.name || "", ci.name || ""].sort().join("|");
+          if (seen.has(key)) return;
+          seen.add(key);
+          links.push({
+            id: key,
+            source: srcDev,
+            target: dstDev,
+            sourceLabel: makeIfLabel(intf.name || "", intf.ip_addresses || []),
+            targetLabel: makeIfLabel(ci.name || "", ci.ip_addresses || [])
+          });
+        });
+      });
+
+      return { devices: Array.from(devMap.values()), links };
+    }
+
+    async function load() {
+      const base = getBaseUrl();
+      const token = getToken();
+      const query = `
+        query {
+          devices {
+            name
+            interfaces {
+              id
+              name
+              ip_addresses {
+                address
+              }
+              connected_interface {
+                id
+                name
+                ip_addresses {
+                  address
+                }
+                device {
+                  name
+                }
+              }
+            }
+          }
+        }
+      `;
+      hint.textContent = "正在通过 GraphQL 加载数据...";
+      const data = await graphqlRequest(base, token, query);
+      const { devices, links } = buildFromGraphql(data);
+      rebuildGraph(devices, links);
+      applyLayout("horizontal");
+      hint.textContent = `已生成拓扑：设备数=${devices.length}，连线数=${links.length}`;
+    }
+
+    document.getElementById("load").addEventListener("click", () => {
+      load().catch(e => {
+        hint.textContent = "加载失败：" + String(e && e.message ? e.message : e);
+      });
+    });
+
+    document.getElementById("layout-h").addEventListener("click", () => applyLayout("horizontal"));
+    document.getElementById("layout-v").addEventListener("click", () => applyLayout("vertical"));
+    document.getElementById("export").addEventListener("click", () => {
+      const payload = JSON.stringify(state, null, 2);
+      const blob = new Blob([payload], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "topology.json";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    });
+  </script>
+</body>
+</html>
