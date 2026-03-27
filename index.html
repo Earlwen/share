@@ -3,229 +3,192 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>网络拓扑图（GraphQL）</title>
+  <title>Nautobot 拓扑（ECharts）</title>
   <style>
     html, body { height: 100%; margin: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei", sans-serif; background: #0f172a; color: #e2e8f0; }
     #app { display: flex; height: 100%; }
-    #toolbar { width: 280px; border-right: 1px solid #1f2937; padding: 12px; box-sizing: border-box; background: #111827; }
-    #canvas-wrap { flex: 1; position: relative; }
-    #topo { width: 100%; height: 100%; }
-    .node circle { fill: #38bdf8; stroke: #0ea5e9; stroke-width: 2; }
-    .node text { fill: #e2e8f0; font-size: 12px; pointer-events: none; }
-    .link path { stroke: #94a3b8; stroke-width: 2; fill: none; }
-    .link text { fill: #f8fafc; font-size: 11px; pointer-events: none; }
-    .label-bg { fill: #1f2937; stroke: #334155; stroke-width: 1; rx: 4; ry: 4; }
-    .node { cursor: grab; }
-    .node.dragging { cursor: grabbing; }
-    button { width: 100%; margin: 6px 0; padding: 8px 10px; border: 1px solid #374151; background: #1f2937; color: #e5e7eb; border-radius: 6px; }
-    button:hover { background: #111827; }
-    input { width: 100%; margin: 6px 0; padding: 8px 10px; border: 1px solid #374151; background: #111827; color: #e5e7eb; border-radius: 6px; box-sizing: border-box; }
-    .hint { font-size: 12px; color: #9ca3af; margin-top: 8px; line-height: 1.4; }
+    #toolbar { width: 300px; border-right: 1px solid #1f2937; padding: 12px; box-sizing: border-box; background: #111827; }
+    #chart { flex: 1; height: 100%; }
+    input, button { width: 100%; box-sizing: border-box; }
+    input { margin: 6px 0; padding: 8px 10px; border: 1px solid #374151; background: #0b1220; color: #e5e7eb; border-radius: 6px; }
+    button { margin: 6px 0; padding: 8px 10px; border: 1px solid #374151; background: #1f2937; color: #e5e7eb; border-radius: 6px; }
+    button:hover { background: #0b1220; }
+    .hint { font-size: 12px; color: #9ca3af; line-height: 1.4; }
+    .row { display: flex; gap: 8px; }
+    .row button { flex: 1; }
   </style>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
 </head>
 <body>
   <div id="app">
     <div id="toolbar">
-      <h3 style="margin:0 0 8px 0">网络拓扑（GraphQL）</h3>
-      <div class="hint" id="hint">数据源：/api/graphql/</div>
-      <input id="nb-url" value="http://172.16.114.128:8080" />
-      <input id="nb-token" type="password" placeholder="Nautobot Token" />
+      <h3 style="margin:0 0 8px 0">拓扑图（ECharts）</h3>
+      <div id="hint" class="hint">数据源：/api/graphql/（通过本地 /proxy 转发 Token）</div>
+      <input id="baseUrl" value="http://172.16.114.128:8080" />
+      <input id="token" type="password" placeholder="Nautobot Token" />
+      <input id="iconBase" placeholder="Cisco 图标 Base URL（可选，如 http://.../icons）" />
+      <input id="locationFilter" list="locationList" placeholder="Location 过滤（下拉/输入提示）" />
+      <datalist id="locationList"></datalist>
+      <input id="deviceFilter" placeholder="设备名字过滤（支持模糊匹配/逗号分隔）" />
+      <label style="display:flex; align-items:center; gap:8px; margin: 6px 0; font-size: 12px; color:#e5e7eb;">
+        <input id="showIsolated" type="checkbox" checked style="width:auto; margin:0;" />
+        显示无关联节点
+      </label>
       <button id="load">从 GraphQL 加载</button>
-      <button id="layout-h">横向布局</button>
-      <button id="layout-v">纵向布局</button>
+      <div class="row">
+        <button id="applyFilter">应用设备名称过滤</button>
+        <button id="clearFilter">清空设备名称过滤</button>
+      </div>
+      <div class="row">
+        <button id="applyLocation">应用Location</button>
+        <button id="clearLocation">清空Location</button>
+      </div>
+      <div class="row">
+        <button id="layoutForce">力导向</button>
+        <button id="layoutH">横向</button>
+        <button id="layoutV">纵向</button>
+      </div>
       <button id="export">导出JSON</button>
     </div>
-    <div id="canvas-wrap">
-      <svg id="topo"></svg>
-    </div>
+    <div id="chart"></div>
   </div>
+
   <script>
-    const state = { devices: [], links: [] };
-    const topo = document.getElementById("topo");
-    const wrap = document.getElementById("canvas-wrap");
     const hint = document.getElementById("hint");
+    const baseUrlEl = document.getElementById("baseUrl");
+    const tokenEl = document.getElementById("token");
+    const iconBaseEl = document.getElementById("iconBase");
+
+    const chart = echarts.init(document.getElementById("chart"), null, { renderer: "canvas" });
+    window.addEventListener("resize", () => chart.resize());
 
     function normalizeBase(u) {
-      return u.replace(/\/+$/, "");
+      return String(u || "").replace(/\/+$/, "");
     }
 
-    function getToken() {
-      return document.getElementById("nb-token").value.trim();
+    function svgToDataUri(svg) {
+      return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
     }
 
-    function getBaseUrl() {
-      return normalizeBase(document.getElementById("nb-url").value.trim());
+    const fallbackIcons = {
+      router: svgToDataUri(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect x="10" y="18" width="44" height="28" rx="8" fill="#0ea5e9"/><circle cx="22" cy="32" r="3" fill="#e2e8f0"/><circle cx="42" cy="32" r="3" fill="#e2e8f0"/><path d="M26 32h12" stroke="#e2e8f0" stroke-width="2"/></svg>`),
+      switch: svgToDataUri(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect x="8" y="20" width="48" height="24" rx="6" fill="#22c55e"/><rect x="16" y="28" width="6" height="6" fill="#052e16"/><rect x="26" y="28" width="6" height="6" fill="#052e16"/><rect x="36" y="28" width="6" height="6" fill="#052e16"/><rect x="46" y="28" width="6" height="6" fill="#052e16"/></svg>`),
+      firewall: svgToDataUri(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect x="14" y="16" width="36" height="32" rx="6" fill="#f97316"/><path d="M18 24h28M18 32h28M18 40h28" stroke="#fff7ed" stroke-width="3"/><path d="M24 16v32M40 16v32" stroke="#fff7ed" stroke-width="3"/></svg>`),
+      server: svgToDataUri(`<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64"><rect x="16" y="14" width="32" height="14" rx="4" fill="#a855f7"/><rect x="16" y="34" width="32" height="16" rx="4" fill="#a855f7"/><circle cx="24" cy="21" r="2" fill="#f5f3ff"/><circle cx="24" cy="41" r="2" fill="#f5f3ff"/><path d="M30 21h14M30 41h14" stroke="#f5f3ff" stroke-width="2"/></svg>`)
+    };
+
+    function guessDeviceType(name) {
+      const n = String(name || "").toLowerCase();
+      if (n.includes("sw") || n.includes("switch")) return "switch";
+      if (n.includes("fw") || n.includes("firewall")) return "firewall";
+      if (n.includes("srv") || n.includes("server")) return "server";
+      if (n.includes("rt") || n.includes("router")) return "router";
+      return "router";
     }
 
-    function size() {
-      const r = wrap.getBoundingClientRect();
-      topo.setAttribute("viewBox", `0 0 ${r.width} ${r.height}`);
-      topo.setAttribute("width", r.width);
-      topo.setAttribute("height", r.height);
-    }
-    size();
-    window.addEventListener("resize", size);
-
-    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-    marker.setAttribute("id", "arrow");
-    marker.setAttribute("viewBox", "0 0 10 10");
-    marker.setAttribute("refX", "10");
-    marker.setAttribute("refY", "5");
-    marker.setAttribute("markerWidth", "8");
-    marker.setAttribute("markerHeight", "8");
-    marker.setAttribute("orient", "auto-start-reverse");
-    const arrow = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    arrow.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
-    arrow.setAttribute("fill", "#94a3b8");
-    marker.appendChild(arrow);
-    defs.appendChild(marker);
-    topo.appendChild(defs);
-
-    const linkLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    const nodeLayer = document.createElementNS("http://www.w3.org/2000/svg", "g");
-    topo.appendChild(linkLayer);
-    topo.appendChild(nodeLayer);
-
-    function linePath(x1, y1, x2, y2) {
-      return `M ${x1} ${y1} L ${x2} ${y2}`;
+    function resolveIcon(name) {
+      const type = guessDeviceType(name);
+      const base = normalizeBase(iconBaseEl.value.trim());
+      if (base) return "image://" + base + "/" + type + ".svg";
+      return "image://" + (fallbackIcons[type] || fallbackIcons.router);
     }
 
-    function findDevice(id) {
-      return state.devices.find(d => d.id === id);
+    function ipLabel(ips) {
+      if (!ips || !ips.length) return "";
+      const list = ips.map(x => x && x.address).filter(Boolean);
+      return Array.from(new Set(list)).slice(0, 2).join(",");
     }
 
-    const nodeEls = new Map();
-    const linkEls = new Map();
-
-    function createNode(d) {
-      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      g.classList.add("node");
-      g.setAttribute("data-id", d.id);
-      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
-      c.setAttribute("cx", d.x);
-      c.setAttribute("cy", d.y);
-      c.setAttribute("r", d.r);
-      const t = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      t.setAttribute("x", d.x);
-      t.setAttribute("y", d.y - d.r - 8);
-      t.setAttribute("text-anchor", "middle");
-      t.textContent = d.name;
-      g.appendChild(c);
-      g.appendChild(t);
-      nodeLayer.appendChild(g);
-      return g;
+    function makeIfLabel(name, ips) {
+      const ip = ipLabel(ips);
+      const n = String(name || "");
+      if (n && ip) return n + " " + ip;
+      return n || ip;
     }
 
-    function createLink(l) {
-      const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-      g.classList.add("link");
-      g.setAttribute("data-id", l.id);
-      const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
-      p.setAttribute("marker-end", "url(#arrow)");
-      const srcBg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      srcBg.classList.add("label-bg");
-      const srcText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      srcText.setAttribute("text-anchor", "middle");
-      srcText.setAttribute("data-role", "src-text");
-      srcText.textContent = l.sourceLabel || "";
-      const tgtBg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
-      tgtBg.classList.add("label-bg");
-      const tgtText = document.createElementNS("http://www.w3.org/2000/svg", "text");
-      tgtText.setAttribute("text-anchor", "middle");
-      tgtText.setAttribute("data-role", "tgt-text");
-      tgtText.textContent = l.targetLabel || "";
-      g.appendChild(p);
-      g.appendChild(srcBg);
-      g.appendChild(srcText);
-      g.appendChild(tgtBg);
-      g.appendChild(tgtText);
-      linkLayer.appendChild(g);
-      return g;
+    async function graphqlQuery(query) {
+      const base = normalizeBase(baseUrlEl.value.trim());
+      const token = tokenEl.value.trim();
+      const url = base + "/api/graphql/";
+      const headers = { "Content-Type": "application/json", "Accept": "application/json" };
+      if (token) headers["Authorization"] = "Token " + token;
+      const proxied = "/proxy?url=" + encodeURIComponent(url);
+      const res = await fetch(proxied, { method: "POST", headers, body: JSON.stringify({ query }) });
+      const text = await res.text();
+      if (!res.ok) {
+        const msg = (text || "").slice(0, 200).replace(/\s+/g, " ").trim();
+        throw new Error("HTTP " + res.status + (msg ? (": " + msg) : ""));
+      }
+      const json = JSON.parse(text);
+      if (json.errors && json.errors.length) throw new Error(json.errors[0].message || "GraphQL error");
+      return json.data;
     }
 
-    function updateNode(d) {
-      const g = nodeEls.get(d.id);
-      if (!g) return;
-      const c = g.querySelector("circle");
-      const t = g.querySelector("text");
-      c.setAttribute("cx", d.x);
-      c.setAttribute("cy", d.y);
-      t.setAttribute("x", d.x);
-      t.setAttribute("y", d.y - d.r - 8);
+    function buildGraph(data) {
+      const devices = (data && data.devices) ? data.devices : [];
+      const deviceLocationByName = new Map();
+      devices.forEach(d => {
+        const dn = d && d.name ? String(d.name) : "";
+        const ln = d && d.location && d.location.name ? String(d.location.name) : "";
+        if (dn && ln) deviceLocationByName.set(dn, ln);
+      });
+      const nodeMap = new Map();
+      function ensureNode(name, locationName) {
+        if (!name) return;
+        if (nodeMap.has(name)) return;
+        const loc = locationName || deviceLocationByName.get(name) || "";
+        nodeMap.set(name, {
+          id: name,
+          name,
+          locationName: loc,
+          symbol: resolveIcon(name),
+          symbolSize: 40,
+          draggable: true,
+          label: { show: true, color: "#e2e8f0", fontSize: 12 }
+        });
+      }
+      devices.forEach(d => ensureNode(d && d.name));
+
+      const links = [];
+      const seen = new Set();
+      devices.forEach(d => {
+        const srcDev = d && d.name;
+        const srcLoc = d && d.location && d.location.name ? String(d.location.name) : "";
+        const ifs = d && d.interfaces ? d.interfaces : [];
+        ifs.forEach(intf => {
+          const ci = intf && intf.connected_interface ? intf.connected_interface : null;
+          if (!ci) return;
+          const dstDev = ci.device && ci.device.name ? ci.device.name : "";
+          if (!srcDev || !dstDev) return;
+          ensureNode(srcDev, srcLoc);
+          ensureNode(dstDev);
+          const aKey = [srcDev, intf.name || ""].join(":");
+          const bKey = [dstDev, ci.name || ""].join(":");
+          const key = [aKey, bKey].sort().join("<->");
+          if (seen.has(key)) return;
+          seen.add(key);
+          const sLabel = makeIfLabel(intf.name || "", intf.ip_addresses || []);
+          const tLabel = makeIfLabel(ci.name || "", ci.ip_addresses || []);
+          links.push({
+            source: srcDev,
+            target: dstDev,
+            label: sLabel + " ⇄ " + tLabel
+          });
+        });
+      });
+
+      return { nodes: Array.from(nodeMap.values()), links };
     }
 
-    function updateLinkGeometry(l) {
-      const s = findDevice(l.source);
-      const t = findDevice(l.target);
-      if (!s || !t) return;
-      const el = linkEls.get(l.id);
-      if (!el) return;
-      const path = el.querySelector("path");
-      const srcRect = el.querySelector("rect:nth-of-type(1)");
-      const srcText = el.querySelector('text[data-role="src-text"]');
-      const tgtRect = el.querySelector("rect:nth-of-type(2)");
-      const tgtText = el.querySelector('text[data-role="tgt-text"]');
-      path.setAttribute("d", linePath(s.x, s.y, t.x, t.y));
-
-      const dx = t.x - s.x;
-      const dy = t.y - s.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const ux = dx / len;
-      const uy = dy / len;
-      const nx = -uy;
-      const ny = ux;
-      const alongSrc = Math.min(len * 0.22, s.r + 28);
-      const alongTgt = Math.min(len * 0.22, t.r + 28);
-      const away = 18;
-
-      const sx = s.x + ux * alongSrc + nx * away;
-      const sy = s.y + uy * alongSrc + ny * away;
-      srcText.setAttribute("x", sx);
-      srcText.setAttribute("y", sy - 6);
-      let bboxS = srcText.getBBox();
-      srcRect.setAttribute("x", bboxS.x - 4);
-      srcRect.setAttribute("y", bboxS.y - 2);
-      srcRect.setAttribute("width", bboxS.width + 8);
-      srcRect.setAttribute("height", bboxS.height + 4);
-
-      const tx = t.x - ux * alongTgt + nx * away;
-      const ty = t.y - uy * alongTgt + ny * away;
-      tgtText.setAttribute("x", tx);
-      tgtText.setAttribute("y", ty - 6);
-      let bboxT = tgtText.getBBox();
-      tgtRect.setAttribute("x", bboxT.x - 4);
-      tgtRect.setAttribute("y", bboxT.y - 2);
-      tgtRect.setAttribute("width", bboxT.width + 8);
-      tgtRect.setAttribute("height", bboxT.height + 4);
-    }
-
-    function updateAllLinks() {
-      state.links.forEach(updateLinkGeometry);
-    }
-
-    function rebuildGraph(devices, links) {
-      nodeLayer.innerHTML = "";
-      linkLayer.innerHTML = "";
-      nodeEls.clear();
-      linkEls.clear();
-      state.devices = devices;
-      state.links = links;
-      state.devices.forEach(d => nodeEls.set(d.id, createNode(d)));
-      state.links.forEach(l => linkEls.set(l.id, createLink(l)));
-      updateAllLinks();
-    }
-
-    function computeLevelsUndirected() {
-      const ids = state.devices.map(d => d.id);
+    function computeLayers(nodes, links) {
+      const ids = nodes.map(n => n.id);
       const adj = new Map(ids.map(id => [id, []]));
-      state.links.forEach(l => {
+      links.forEach(l => {
         if (adj.has(l.source)) adj.get(l.source).push(l.target);
         if (adj.has(l.target)) adj.get(l.target).push(l.source);
       });
       const level = new Map();
-      let curLevel = 0;
       for (const start of ids) {
         if (level.has(start)) continue;
         level.set(start, 0);
@@ -240,7 +203,6 @@
             }
           });
         }
-        curLevel++;
       }
       const layers = [];
       ids.forEach(id => {
@@ -251,12 +213,147 @@
       return layers.filter(Boolean);
     }
 
-    function applyLayout(orientation) {
-      const layers = computeLevelsUndirected();
-      const rect = wrap.getBoundingClientRect();
-      const W = rect.width, H = rect.height;
+    let current = { nodes: [], links: [] };
+    let fullGraph = { nodes: [], links: [] };
+    let currentLayout = "force";
+
+    function updateLocationOptions(graph) {
+      const list = document.getElementById("locationList");
+      const values = Array.from(new Set((graph.nodes || []).map(n => n.locationName).filter(Boolean)));
+      values.sort((a, b) => a.localeCompare(b));
+      list.innerHTML = "";
+      values.forEach(v => {
+        const opt = document.createElement("option");
+        opt.value = v;
+        list.appendChild(opt);
+      });
+    }
+
+    function filterByLocation(graph) {
+      const raw = (document.getElementById("locationFilter").value || "").trim();
+      if (!raw) return graph;
+      const term = raw.toLowerCase();
+      const kept = graph.nodes.filter(n => String(n.locationName || "").toLowerCase().includes(term));
+      const keptSet = new Set(kept.map(n => n.id));
+      const keptLinks = graph.links.filter(l => keptSet.has(l.source) && keptSet.has(l.target));
+      return { nodes: kept, links: keptLinks };
+    }
+
+    function filterByDeviceName(graph) {
+      const raw = document.getElementById("deviceFilter").value || "";
+      const terms = raw.split(",").map(s => s.trim()).filter(Boolean);
+      if (terms.length === 0) return { graph, matched: [] };
+      const lowerTerms = terms.map(t => t.toLowerCase());
+      const matched = graph.nodes.filter(n => {
+        const name = String(n.name || n.id || "").toLowerCase();
+        return lowerTerms.some(t => name.includes(t));
+      }).map(n => n.id);
+      if (matched.length === 0) return { graph: { nodes: [], links: [] }, matched: [] };
+      const adj = new Map();
+      graph.nodes.forEach(n => adj.set(n.id, []));
+      graph.links.forEach(l => {
+        if (adj.has(l.source)) adj.get(l.source).push(l.target);
+        if (adj.has(l.target)) adj.get(l.target).push(l.source);
+      });
+      const kept = new Set();
+      const q = [];
+      matched.forEach(id => {
+        if (!kept.has(id)) {
+          kept.add(id);
+          q.push(id);
+        }
+      });
+      for (let qi = 0; qi < q.length; qi++) {
+        const u = q[qi];
+        (adj.get(u) || []).forEach(v => {
+          if (!kept.has(v)) {
+            kept.add(v);
+            q.push(v);
+          }
+        });
+      }
+      const nodes = graph.nodes.filter(n => kept.has(n.id));
+      const links = graph.links.filter(l => kept.has(l.source) && kept.has(l.target));
+      return { graph: { nodes, links }, matched };
+    }
+
+    function filterIsolated(graph) {
+      const show = document.getElementById("showIsolated").checked;
+      if (show) return graph;
+      const deg = new Map();
+      graph.nodes.forEach(n => deg.set(n.id, 0));
+      graph.links.forEach(l => {
+        deg.set(l.source, (deg.get(l.source) || 0) + 1);
+        deg.set(l.target, (deg.get(l.target) || 0) + 1);
+      });
+      const kept = graph.nodes.filter(n => (deg.get(n.id) || 0) > 0);
+      const keptSet = new Set(kept.map(n => n.id));
+      const keptLinks = graph.links.filter(l => keptSet.has(l.source) && keptSet.has(l.target));
+      return { nodes: kept, links: keptLinks };
+    }
+
+    function applyIsolatedFilterAndRender() {
+      const step0 = filterByLocation(fullGraph);
+      const step1 = filterByDeviceName(step0);
+      current = filterIsolated(step1.graph);
+      if (currentLayout === "horizontal") {
+        applyLayered("horizontal");
+        return;
+      }
+      if (currentLayout === "vertical") {
+        applyLayered("vertical");
+        return;
+      }
+      render("force");
+    }
+
+    function render(layout) {
+      currentLayout = layout;
+      const series = {
+        type: "graph",
+        layout: layout === "force" ? "force" : "none",
+        roam: true,
+        data: current.nodes,
+        links: current.links,
+        draggable: true,
+        edgeSymbol: ["none", "arrow"],
+        edgeSymbolSize: [0, 10],
+        lineStyle: { color: "#94a3b8", width: 2, curveness: 0 },
+        label: { show: true, position: "bottom", color: "#e2e8f0" },
+        edgeLabel: {
+          show: true,
+          formatter: params => params.data.label || "",
+          color: "#f8fafc",
+          fontSize: 11,
+          backgroundColor: "rgba(17,24,39,0.9)",
+          padding: [2, 4],
+          borderRadius: 4
+        },
+        emphasis: { focus: "adjacency" },
+        force: { repulsion: 260, edgeLength: 140, gravity: 0.08 }
+      };
+      chart.setOption({
+        backgroundColor: "#0f172a",
+        tooltip: {
+          trigger: "item",
+          formatter: params => {
+            if (params.dataType === "node") return params.data.name || "";
+            if (params.dataType === "edge") return params.data.label || "";
+            return "";
+          }
+        },
+        series: [series]
+      }, true);
+    }
+
+    function applyLayered(orientation) {
+      currentLayout = orientation;
+      const rect = chart.getDom().getBoundingClientRect();
+      const W = rect.width || 1200;
+      const H = rect.height || 800;
       const margin = 80;
-      const L = layers.length;
+      const layers = computeLayers(current.nodes, current.links);
+      const L = layers.length || 1;
       if (orientation === "horizontal") {
         const xStep = L > 1 ? (W - margin * 2) / (L - 1) : 0;
         layers.forEach((layer, i) => {
@@ -264,10 +361,9 @@
           const n = layer.length;
           const yStep = n > 0 ? (H - margin * 2) / (n + 1) : 0;
           layer.forEach((id, j) => {
-            const d = findDevice(id);
-            d.x = x;
-            d.y = margin + (j + 1) * yStep;
-            updateNode(d);
+            const node = current.nodes.find(n => n.id === id);
+            node.x = x;
+            node.y = margin + (j + 1) * yStep;
           });
         });
       } else {
@@ -277,189 +373,119 @@
           const n = layer.length;
           const xStep = n > 0 ? (W - margin * 2) / (n + 1) : 0;
           layer.forEach((id, j) => {
-            const d = findDevice(id);
-            d.y = y;
-            d.x = margin + (j + 1) * xStep;
-            updateNode(d);
+            const node = current.nodes.find(n => n.id === id);
+            node.x = margin + (j + 1) * xStep;
+            node.y = y;
           });
         });
       }
-      updateAllLinks();
+      render("none");
     }
 
-    let dragId = null;
-    let dragOffset = { x: 0, y: 0 };
-
-    function getPointer(evt) {
-      const pt = topo.createSVGPoint();
-      pt.x = evt.clientX;
-      pt.y = evt.clientY;
-      const m = topo.getScreenCTM().inverse();
-      const p = pt.matrixTransform(m);
-      return { x: p.x, y: p.y };
-    }
-
-    nodeLayer.addEventListener("pointerdown", e => {
-      const g = e.target.closest(".node");
-      if (!g) return;
-      const id = g.getAttribute("data-id");
-      const d = findDevice(id);
-      const p = getPointer(e);
-      dragId = id;
-      dragOffset.x = p.x - d.x;
-      dragOffset.y = p.y - d.y;
-      g.classList.add("dragging");
-      topo.setPointerCapture(e.pointerId);
-    });
-
-    topo.addEventListener("pointermove", e => {
-      if (!dragId) return;
-      const d = findDevice(dragId);
-      const p = getPointer(e);
-      const r = wrap.getBoundingClientRect();
-      const minX = d.r + 4;
-      const minY = d.r + 4;
-      const maxX = r.width - d.r - 4;
-      const maxY = r.height - d.r - 4;
-      d.x = Math.max(minX, Math.min(maxX, p.x - dragOffset.x));
-      d.y = Math.max(minY, Math.min(maxY, p.y - dragOffset.y));
-      updateNode(d);
-      updateAllLinks();
-    });
-
-    topo.addEventListener("pointerup", e => {
-      if (!dragId) return;
-      const g = nodeEls.get(dragId);
-      if (g) g.classList.remove("dragging");
-      dragId = null;
-      topo.releasePointerCapture(e.pointerId);
-    });
-
-    function ipLabel(ips) {
-      if (!ips || !ips.length) return "";
-      const list = ips.map(x => x && x.address).filter(Boolean);
-      return Array.from(new Set(list)).slice(0, 2).join(",");
-    }
-
-    function makeIfLabel(name, ips) {
-      const ip = ipLabel(ips);
-      return name ? (name + (ip ? (" " + ip) : "")) : (ip || "");
-    }
-
-    async function graphqlRequest(baseUrl, token, query) {
-      const headers = { "Content-Type": "application/json", Accept: "application/json" };
-      if (token) headers["Authorization"] = "Token " + token;
-      const target = baseUrl + "/api/graphql/";
-      const proxied = window.location.origin + "/proxy?url=" + encodeURIComponent(target);
-      const res = await fetch(proxied, { method: "POST", headers, body: JSON.stringify({ query }) });
-      const text = await res.text();
-      if (!res.ok) {
-        const msg = (text || "").slice(0, 200).replace(/\s+/g, " ").trim();
-        throw new Error("HTTP " + res.status + (msg ? (": " + msg) : ""));
-      }
-      const json = JSON.parse(text);
-      if (json.errors && json.errors.length) throw new Error(json.errors[0].message || "GraphQL error");
-      return json.data;
-    }
-
-    function buildFromGraphql(data) {
-      const rect = wrap.getBoundingClientRect();
-      const W = rect.width || 800;
-      const H = rect.height || 600;
-      const margin = 90;
-      const devMap = new Map();
-      const links = [];
-      const seen = new Set();
-
-      function ensureDevice(name) {
-        if (!name) return;
-        if (devMap.has(name)) return;
-        const idx = devMap.size;
-        devMap.set(name, {
-          id: name,
-          name,
-          x: margin + (idx % 10) * 70,
-          y: margin + Math.floor(idx / 10) * 55,
-          r: 18
-        });
-      }
-
-      const devices = (data && data.devices) ? data.devices : [];
-      devices.forEach(d => ensureDevice(d && d.name));
-
-      devices.forEach(d => {
-        const srcDev = d && d.name;
-        const ifs = d && d.interfaces ? d.interfaces : [];
-        ifs.forEach(intf => {
-          const ci = intf && intf.connected_interface ? intf.connected_interface : null;
-          if (!ci) return;
-          const dstDev = ci.device && ci.device.name ? ci.device.name : "";
-          if (!srcDev || !dstDev) return;
-          ensureDevice(srcDev);
-          ensureDevice(dstDev);
-          const aId = String(intf.id || "");
-          const bId = String(ci.id || "");
-          const key = [aId, bId].filter(Boolean).sort().join("|") || [srcDev, dstDev, intf.name || "", ci.name || ""].sort().join("|");
-          if (seen.has(key)) return;
-          seen.add(key);
-          links.push({
-            id: key,
-            source: srcDev,
-            target: dstDev,
-            sourceLabel: makeIfLabel(intf.name || "", intf.ip_addresses || []),
-            targetLabel: makeIfLabel(ci.name || "", ci.ip_addresses || [])
-          });
-        });
-      });
-
-      return { devices: Array.from(devMap.values()), links };
-    }
-
-    async function load() {
-      const base = getBaseUrl();
-      const token = getToken();
-      const query = `
-        query {
-          devices {
-            name
-            interfaces {
-              id
+    document.getElementById("load").addEventListener("click", async () => {
+      try {
+        hint.textContent = "正在通过 GraphQL 加载数据...";
+        const query = `
+          query {
+            devices {
               name
-              ip_addresses {
-                address
-              }
-              connected_interface {
+              location {
                 id
                 name
-                ip_addresses {
-                  address
-                }
-                device {
+              }
+              interfaces {
+                name
+                connected_interface {
+                  id
                   name
+                  ip_addresses { address }
+                  device { name }
                 }
+                ip_addresses {
+                  id
+                  address
+                  ip4_vdcs { id }
+                }
+              }
+              primary_ip {
+                ip4_vdcs { id }
               }
             }
           }
+        `;
+        const data = await graphqlQuery(query);
+        fullGraph = buildGraph(data);
+        updateLocationOptions(fullGraph);
+        const step0 = filterByLocation(fullGraph);
+        const step1 = filterByDeviceName(step0);
+        current = filterIsolated(step1.graph);
+        const rawDevice = (document.getElementById("deviceFilter").value || "").trim();
+        if (step1.matched.length === 0 && rawDevice) {
+          hint.textContent = "未匹配到设备，已清空展示（请检查设备名过滤条件）";
+        } else {
+          hint.textContent = "已生成拓扑：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
         }
-      `;
-      hint.textContent = "正在通过 GraphQL 加载数据...";
-      const data = await graphqlRequest(base, token, query);
-      const { devices, links } = buildFromGraphql(data);
-      rebuildGraph(devices, links);
-      applyLayout("horizontal");
-      hint.textContent = `已生成拓扑：设备数=${devices.length}，连线数=${links.length}`;
-    }
-
-    document.getElementById("load").addEventListener("click", () => {
-      load().catch(e => {
+        currentLayout = "force";
+        render("force");
+      } catch (e) {
         hint.textContent = "加载失败：" + String(e && e.message ? e.message : e);
-      });
+      }
     });
 
-    document.getElementById("layout-h").addEventListener("click", () => applyLayout("horizontal"));
-    document.getElementById("layout-v").addEventListener("click", () => applyLayout("vertical"));
+    document.getElementById("layoutForce").addEventListener("click", () => render("force"));
+    document.getElementById("layoutH").addEventListener("click", () => applyLayered("horizontal"));
+    document.getElementById("layoutV").addEventListener("click", () => applyLayered("vertical"));
+    document.getElementById("showIsolated").addEventListener("change", () => {
+      applyIsolatedFilterAndRender();
+      hint.textContent = "已更新显示选项：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+    });
+    document.getElementById("applyLocation").addEventListener("click", () => {
+      applyIsolatedFilterAndRender();
+      const raw = (document.getElementById("locationFilter").value || "").trim();
+      hint.textContent = raw
+        ? ("已应用 Location 过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length)
+        : ("未设置 Location，当前显示设备数=" + current.nodes.length + "，连线数=" + current.links.length);
+    });
+    document.getElementById("clearLocation").addEventListener("click", () => {
+      document.getElementById("locationFilter").value = "";
+      applyIsolatedFilterAndRender();
+      hint.textContent = "已清空 Location 过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+    });
+    document.getElementById("applyFilter").addEventListener("click", () => {
+      applyIsolatedFilterAndRender();
+      const raw = (document.getElementById("deviceFilter").value || "").trim();
+      if (!raw) {
+        hint.textContent = "已清空设备过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+        return;
+      }
+      if (current.nodes.length === 0) {
+        hint.textContent = "未匹配到设备，已清空展示（请检查设备名过滤条件）";
+        return;
+      }
+      hint.textContent = "已应用设备过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+    });
+    document.getElementById("clearFilter").addEventListener("click", () => {
+      document.getElementById("deviceFilter").value = "";
+      applyIsolatedFilterAndRender();
+      hint.textContent = "已清空设备过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+    });
+    document.getElementById("deviceFilter").addEventListener("keydown", e => {
+      if (e.key !== "Enter") return;
+      applyIsolatedFilterAndRender();
+      const raw = (document.getElementById("deviceFilter").value || "").trim();
+      if (!raw) {
+        hint.textContent = "已清空设备过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+        return;
+      }
+      if (current.nodes.length === 0) {
+        hint.textContent = "未匹配到设备，已清空展示（请检查设备名过滤条件）";
+        return;
+      }
+      hint.textContent = "已应用设备过滤：设备数=" + current.nodes.length + "，连线数=" + current.links.length;
+    });
+
     document.getElementById("export").addEventListener("click", () => {
-      const payload = JSON.stringify(state, null, 2);
+      const payload = JSON.stringify(current, null, 2);
       const blob = new Blob([payload], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -470,6 +496,8 @@
       a.remove();
       URL.revokeObjectURL(url);
     });
+
+    render("force");
   </script>
 </body>
 </html>
